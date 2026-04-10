@@ -50,3 +50,14 @@ The origin story: sitting in Obývák (tvujpivnibar.cz) watching two beers get s
 - **Price display** — optional field in the data model, useful for the discovery site
 - **Opening hours** — passive signal for the "open now" filter, doesn't need to be real-time
 - **Instagram Stories** — auto-generated tap list graphic, potentially more reach than Facebook for the craft beer demographic in Prague
+
+## Fridge / bottle inventory — deferred
+
+The idea of tracking bottle and can inventory was considered. Decision: **not in scope for now.**
+
+Reasons:
+- Tap management is a single binary action at a predictable moment (keg switch). Fridge inventory is ongoing stock management — a fundamentally different behaviour ask from the owner
+- Adding it risks losing the "feather light" quality that makes the tap list adoptable
+- The moment it becomes stock management software, the lazy-owner-friendly pitch breaks down
+
+**If revisited later:** a low-fidelity "we stock these" list (presence only, no quantities, no real-time accuracy expectation) could work as an optional addition without threatening the core. But taps come first and stay the sharp, reliable, always-current feature.
