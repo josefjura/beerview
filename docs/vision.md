@@ -61,3 +61,22 @@ Reasons:
 - The moment it becomes stock management software, the lazy-owner-friendly pitch breaks down
 
 **If revisited later:** a low-fidelity "we stock these" list (presence only, no quantities, no real-time accuracy expectation) could work as an optional addition without threatening the core. But taps come first and stay the sharp, reliable, always-current feature.
+
+
+## Physical display — wild ideas
+
+### LED matrix display
+A low-res LED panel above the bar showing the live tap list, updating the moment the owner hits Switch. No chalk, no marker, ever again. Genuinely sexy.
+
+Complexity: hardware manufacturing/sourcing, shipping, pub wifi integration, physical support. A completely different business from software. **Park until the software is proven.**
+
+### Tablet kiosk mode — the sane stepping stone
+Same concept, no custom hardware. A cheap Android tablet mounted behind the bar, browser open in kiosk/full-screen mode, auto-refreshing the beerview tap list display.
+
+- Pub buys their own tablet (~40€)
+- Open beerview kiosk URL, enable stay-awake
+- Done — live tap list on a screen, zero maintenance
+
+This is the MVP of the display idea. Build the kiosk view (large text, high contrast, readable from across a bar) before thinking about LED hardware.
+
+LED display becomes the premium future version once the software has proven itself in the wild.
