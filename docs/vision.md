@@ -80,3 +80,22 @@ Same concept, no custom hardware. A cheap Android tablet mounted behind the bar,
 This is the MVP of the display idea. Build the kiosk view (large text, high contrast, readable from across a bar) before thinking about LED hardware.
 
 LED display becomes the premium future version once the software has proven itself in the wild.
+
+
+## The display as the primary output
+
+Revised framing: for some pubs, a wall-mounted display *replaces the chalkboard entirely*. The owner uses only the beerview admin app — no website embed, no Facebook bot needed. The display handles everything visible in the pub.
+
+This is actually the purest version of the product:
+- Owner switches a keg → display updates automatically
+- Customers see the current tap list on the wall
+- Zero chalkboard, zero website editing, zero social posting
+- The admin app is the only thing the owner ever touches
+
+**Implications:**
+- The display view needs to be designed for readability at distance — large text, high contrast, minimal chrome
+- A cheap wall-mounted screen (TV or monitor) running a browser in kiosk mode is enough for the MVP — no custom hardware needed yet
+- The pub supplies the screen; beerview supplies the URL they open on it
+- No app to install, no device to configure beyond "open this URL and go fullscreen"
+
+**LED matrix as the premium evolution:** once the concept is proven, a purpose-built low-res LED display (thinner, lower power, more pub-aesthetic) becomes an interesting hardware product. But the TV-on-the-wall version validates the idea for free.
