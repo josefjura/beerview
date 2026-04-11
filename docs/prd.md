@@ -358,7 +358,7 @@ The PoC is considered successful if:
 
 | Feature | Notes |
 |---|---|
-| Facebook auto-posting | Requires Meta App Review (weeks); deferred. Post format when built: full tap list ("We're opening, here's what's on tap today") not per-switch notifications, though per-switch alerts may also be useful |
+| Facebook auto-posting | Requires Meta App Review (weeks); deferred. Post format when built: full tap list announcement ("We're opening, here's what's on tap today") — not per-switch notifications, which would be aggressive and redundant given the live discovery site |
 | Instagram auto-posting | Same; Stories API may not exist |
 | Social clipboard copy | Simple workaround for PoC — owner copies formatted tap list to paste into their own Facebook/Instagram post |
 | Self-serve pub registration | Manual for PoC; needs homepage + onboarding for release |
