@@ -209,7 +209,64 @@ Currency is CZK. Sizes are free-form strings. Array may be empty (no price shown
 | Multi-user | Multiple user accounts per pub; all have equal rights |
 | Session expiry | Must not expire during service hours; long-lived sessions |
 
-### 6.9 Resilience
+### 6.9 Outbound Webhooks
+
+Pubs can register a webhook URL that beerview calls whenever their tap list changes. This makes the integration model technology-agnostic — any system capable of receiving an HTTP POST can react to tap changes without beerview needing to build a dedicated integration.
+
+| Requirement | Detail |
+|---|---|
+| Registration | Pub admin can set a webhook URL in settings |
+| Trigger | Fires after every successful Switch, Mark Empty, or Quick/Full Add |
+| Payload | Full current tap list (not a diff) on every call |
+| Schema version | Payload includes `schema_version` field for forward compatibility |
+| Delivery | Best-effort for PoC; retry outbox table for full release |
+| Security | Webhook URL is owner-supplied; optionally a shared secret header for verification |
+
+**Payload format:**
+```json
+{
+  "schema_version": "1",
+  "event": "tap_list_updated",
+  "pub_slug": "u-cerneho-vola",
+  "timestamp": "2026-04-11T13:45:00Z",
+  "taps": [
+    {
+      "tap_number": 1,
+      "beer": {
+        "name": "Raptor IPA",
+        "brewery": "Matuška",
+        "style": "IPA",
+        "abv": 6.5
+      },
+      "prices": [
+        { "size": "0.5l", "price": 79 },
+        { "size": "0.3l", "price": 52 }
+      ]
+    }
+  ]
+}
+```
+
+### 6.10 API Versioning
+
+All externally-facing endpoints (public tap list, embed API, webhook payloads) are versioned. Internal owner app routes are not versioned — beerview controls both ends.
+
+| Requirement | Detail |
+|---|---|
+| URL scheme | `/v1/` prefix on all public API routes |
+| Embed script | `embed.js` always latest and backwards-compatible; versioned endpoint `/v1/embed.js` available as stable pin |
+| Webhook payload | `schema_version` field in every payload body |
+| Parallel versions | When v2 ships, v1 and v2 run in parallel until consumers migrate |
+| Internal routes | `/admin/*` and `/auth/*` are unversioned |
+
+**Public API with versioning:**
+```
+GET  /v1/pubs                    — discovery site list
+GET  /v1/pubs/:slug              — pub detail + taps
+GET  /v1/pubs/:slug/taps         — tap list JSON (for embed widget)
+```
+
+### 6.11 Resilience
 
 | Requirement | Detail |
 |---|---|
@@ -217,6 +274,7 @@ Currency is CZK. Sizes are free-form strings. Array may be empty (no price shown
 | True offline | Out of scope |
 | Switch failure | If server unreachable, show clear retry prompt (never silent fail) |
 | External APIs | If Untappd/beer DB unavailable, fall back to manual entry silently |
+| Webhook failure | Best-effort for PoC; logged but not retried |
 
 ---
 
@@ -231,6 +289,8 @@ Currency is CZK. Sizes are free-form strings. Array may be empty (no price shown
 | neighbourhood | TEXT | e.g. "Žižkov" |
 | tap_count | INTEGER | Set at creation |
 | is_offline | BOOLEAN | Owner-controlled; hides tap list |
+| webhook_url | TEXT | nullable; outbound webhook on tap changes |
+| webhook_secret | TEXT | nullable; sent as header for verification |
 | created_at | DATETIME | |
 | updated_at | DATETIME | |
 
@@ -292,9 +352,9 @@ Currency is CZK. Sizes are free-form strings. Array may be empty (no price shown
 
 ### Public (no auth)
 ```
-GET  /pubs                          — discovery site: list all non-offline pubs
-GET  /pubs/:slug                    — pub detail + current taps
-GET  /pubs/:slug/taps               — current tap list (JSON for embed widget)
+GET  /v1/pubs                       — discovery site: list all non-offline pubs
+GET  /v1/pubs/:slug                 — pub detail + current taps
+GET  /v1/pubs/:slug/taps            — current tap list (JSON for embed widget)
 ```
 
 ### Owner (session auth)
