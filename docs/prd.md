@@ -203,7 +203,9 @@ Currency is CZK. Sizes are free-form strings. Array may be empty (no price shown
 | Requirement | Detail |
 |---|---|
 | Auth method | Session-based (cookie); fits HTMX server-rendered model |
-| Account creation | Manual by developer for PoC |
+| Account creation | Manual by developer for PoC; developer sets a default password |
+| First login | User must change their default password on first login |
+| Password change | Available in user settings at any time |
 | Multi-user | Multiple user accounts per pub; all have equal rights |
 | Session expiry | Must not expire during service hours; long-lived sessions |
 
@@ -356,9 +358,9 @@ The PoC is considered successful if:
 
 | Feature | Notes |
 |---|---|
-| Facebook auto-posting | Requires Meta App Review (weeks); deferred |
+| Facebook auto-posting | Requires Meta App Review (weeks); deferred. Post format when built: full tap list ("We're opening, here's what's on tap today") not per-switch notifications, though per-switch alerts may also be useful |
 | Instagram auto-posting | Same; Stories API may not exist |
-| Social clipboard copy | Simple workaround for PoC — owner copies formatted tap list |
+| Social clipboard copy | Simple workaround for PoC — owner copies formatted tap list to paste into their own Facebook/Instagram post |
 | Self-serve pub registration | Manual for PoC; needs homepage + onboarding for release |
 | Staff roles & permissions | Flat multi-user for PoC |
 | Kiosk / wall display view | Nice to have; TV + browser URL is the approach when ready |
