@@ -160,6 +160,12 @@ use axum::response::{Html, IntoResponse, Redirect};
 use axum::Extension;
 
 // State extractor — access the shared AppState (database pool, config)
+//
+// Extension(session): Extension<Session> — reads the Session value that the
+// require_auth middleware inserted via request.extensions_mut().insert(Session{...}).
+// This is ONLY available on routes that have require_auth in their middleware stack.
+// Handlers behind require_auth can always use this pattern — the middleware
+// guarantees the extension is present before the handler runs.
 async fn show_taps(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
@@ -262,6 +268,14 @@ pub async fn run_migrations(pool: &SqlitePool) {
         .expect("Failed to run migrations");
 }
 ```
+
+**Important:** The `sqlx::migrate!("./migrations")` macro resolves the path at **compile time**. If the `migrations/` directory does not exist when you run `cargo build`, you will get a cryptic compile error. Create the directory first (it can be empty):
+
+```bash
+mkdir -p migrations
+```
+
+Call `run_migrations(&pool)` on every server startup — it is safe to call repeatedly; SQLx tracks which migrations have run in the `_sqlx_migrations` table and skips already-applied ones.
 
 ### Query Macros
 
@@ -407,6 +421,49 @@ pub async fn execute_switch(
     })
 }
 ```
+
+### JSON Columns in SQLite
+
+The `prices` column on `tap` and `queue_item` is stored as a TEXT JSON string. SQLx has no built-in JSON type for SQLite — you must serialize/deserialize manually with `serde_json`.
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PriceEntry {
+    pub size: String,
+    pub price: i64,
+}
+
+/// Deserialize prices from the DB TEXT column.
+/// Returns empty Vec if the column is NULL or invalid JSON.
+pub fn parse_prices(prices_json: Option<&str>) -> Vec<PriceEntry> {
+    prices_json
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default()
+}
+
+/// Serialize prices for storage in the DB TEXT column.
+pub fn serialize_prices(prices: &[PriceEntry]) -> String {
+    serde_json::to_string(prices).unwrap_or_else(|_| "[]".to_string())
+}
+```
+
+**Storing prices (from a form):**
+```rust
+let prices_json = serialize_prices(&form.prices);
+sqlx::query!(
+    "UPDATE tap SET prices = ? WHERE pub_id = ? AND tap_number = ?",
+    prices_json, pub_id, tap_number
+).execute(&state.db).await?;
+```
+
+**Reading prices:**
+```rust
+let prices = parse_prices(tap.prices.as_deref());  // Vec<PriceEntry>
+```
+
+**NULL vs empty array:** An empty tap has `prices = NULL` in the database. A tap with known prices has `prices = '[{"size":"0.5l","price":72}]'`. Always check for NULL — `parse_prices(None)` correctly returns an empty Vec.
 
 ### Error Handling from DB Calls
 
@@ -846,7 +903,17 @@ pub fn render_switch_response(
 }
 ```
 
-The element with `hx-swap-oob="true"` must have an `id` that matches an existing element on the page. HTMX silently does nothing if no matching element is found.
+The element with `hx-swap-oob="true"` must have an `id` that matches an existing element on the page. **HTMX silently does nothing if no matching element is found** — there is no error, no console warning, nothing. This is a common silent failure mode.
+
+**How to debug OOB swaps not working:**
+1. Open browser DevTools → Network tab
+2. Click the switch button, find the POST request
+3. Click "Response" — you should see the HTML returned by the server
+4. Verify the response contains an element with `id="queue-list"` and `hx-swap-oob="true"`
+5. Verify the page contains an element with `id="queue-list"` before the request
+6. If both exist but swap doesn't happen: check for typos in the id value
+
+**Prevention:** Always define the swappable container ids in the layout/page template first, then reference the same id in the OOB response. Never generate ids dynamically for OOB targets.
 
 ### COMPLETE WORKED EXAMPLE: Switching a Tap
 
@@ -986,6 +1053,164 @@ pub async fn switch_tap(
 
 The owner sees the tap card update and the queue shrink — no page reload.
 
+### WORKED EXAMPLE: 30-Second Undo After Switch
+
+The PRD requires a 30-second undo window. Implementation strategy: store the previous state in the database at switch time; the undo handler restores it if within 30 seconds.
+
+**Step 1: Add undo table (new migration)**
+
+```sql
+-- migrations/20260401000006_create_tap_switch_undo.sql
+CREATE TABLE IF NOT EXISTS tap_switch_undo (
+    pub_id INTEGER NOT NULL,
+    tap_number INTEGER NOT NULL,
+    prev_beer_id INTEGER,           -- NULL means tap was empty before the switch
+    prev_prices TEXT,
+    switched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (pub_id, tap_number)
+);
+```
+
+**Step 2: Store undo state in `execute_switch` (add after step 4)**
+
+```rust
+// After "4. Put the new beer on tap" in execute_switch:
+sqlx::query!(
+    "INSERT OR REPLACE INTO tap_switch_undo (pub_id, tap_number, prev_beer_id, prev_prices, switched_at)
+     VALUES (?, ?, ?, ?, datetime('now'))",
+    pub_id,
+    tap_number,
+    current_tap.beer_id,   // what was on tap before the switch (may be NULL)
+    current_tap.prices
+)
+.execute(tx.as_mut())
+.await?;
+```
+
+**Step 3: Include undo button in the switch response**
+
+```rust
+pub fn render_switch_response(
+    updated_tap: &Tap,
+    beer: Option<&Beer>,
+    remaining_queue: &[QueueItemWithBeer],
+    session: &Session,
+) -> Markup {
+    html! {
+        div class="tap-card" id={"tap-" (updated_tap.tap_number)} {
+            // ... tap content ...
+            div class="tap-actions" {
+                // Undo button — always shown immediately after switch
+                form hx-post={"/admin/taps/" (updated_tap.tap_number) "/undo"}
+                     hx-target={"#tap-" (updated_tap.tap_number)}
+                     hx-swap="outerHTML"
+                {
+                    input type="hidden" name="csrf_token" value=(session.csrf_token);
+                    button type="submit" class="btn-undo" { "Undo (30s)" }
+                }
+            }
+        }
+
+        // OOB update the queue list
+        div id="queue-list" hx-swap-oob="true" {
+            @for item in remaining_queue {
+                (render_queue_item(item, &session.csrf_token))
+            }
+        }
+    }
+}
+```
+
+**Step 4: The undo handler**
+
+```rust
+#[derive(Deserialize)]
+pub struct CsrfForm {
+    pub csrf_token: String,
+}
+
+pub async fn undo_switch(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(tap_number): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> impl IntoResponse {
+    if form.csrf_token != session.csrf_token {
+        return (StatusCode::FORBIDDEN, Html("Forbidden".to_string())).into_response();
+    }
+
+    // Check undo window (30 seconds from switch)
+    let undo = sqlx::query!(
+        "SELECT prev_beer_id, prev_prices
+         FROM tap_switch_undo
+         WHERE pub_id = ? AND tap_number = ?
+           AND switched_at > datetime('now', '-30 seconds')",
+        session.pub_id,
+        tap_number
+    )
+    .fetch_optional(&state.db)
+    .await;
+
+    match undo {
+        Ok(None) => {
+            // Window expired — return the tap card without undo button
+            // (reload current state so owner sees what's there now)
+            match load_tap_with_beer(&state.db, session.pub_id, tap_number).await {
+                Ok((tap, beer)) => Html(
+                    render_tap_card_with_actions(&tap, beer.as_ref(), &[], session)
+                        .into_string()
+                ).into_response(),
+                Err(_) => Html("<p class='error'>Undo window expired.</p>".to_string()).into_response(),
+            }
+        }
+        Ok(Some(undo)) => {
+            // Restore previous beer on this tap
+            let result = sqlx::query!(
+                "UPDATE tap SET beer_id = ?, prices = ?, updated_at = datetime('now')
+                 WHERE pub_id = ? AND tap_number = ?",
+                undo.prev_beer_id,
+                undo.prev_prices,
+                session.pub_id,
+                tap_number
+            )
+            .execute(&state.db)
+            .await;
+
+            // Delete the undo record so it can't be used twice
+            let _ = sqlx::query!(
+                "DELETE FROM tap_switch_undo WHERE pub_id = ? AND tap_number = ?",
+                session.pub_id,
+                tap_number
+            )
+            .execute(&state.db)
+            .await;
+
+            match result {
+                Ok(_) => {
+                    match load_tap_with_beer(&state.db, session.pub_id, tap_number).await {
+                        Ok((tap, beer)) => Html(
+                            render_tap_card_with_actions(&tap, beer.as_ref(), &[], session)
+                                .into_string()
+                        ).into_response(),
+                        Err(_) => Redirect::to("/admin/taps").into_response(),
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Undo failed for tap {tap_number}: {e}");
+                    Html(render_error_partial("Undo failed").into_string()).into_response()
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("Undo DB error: {e}");
+            Html(render_error_partial("Database error").into_string()).into_response()
+        }
+    }
+}
+```
+
+**Note:** The undo handler does NOT re-add the queue item (the beer was already consumed). After undo, the tap goes back to the previous beer (or empty), but the queue item that was switched is gone. This is intentional — undo is for "I clicked the wrong tap", not "I want the keg back".
+
 ### HTMX Anti-Patterns Summary
 
 | Anti-Pattern | Problem | Fix |
@@ -1063,6 +1288,8 @@ pub struct Session {
 
 ### Accessing Session in Handlers
 
+The `require_auth` middleware inserts a `Session` into every request's extension map (via `request.extensions_mut().insert(...)`). Handlers use `Extension(session): Extension<Session>` to read it. This is NOT `tower::ServiceExt::layer` global state — it's per-request data set by the middleware before the handler runs.
+
 ```rust
 async fn show_taps(
     State(state): State<AppState>,
@@ -1072,6 +1299,8 @@ async fn show_taps(
     // ...
 }
 ```
+
+**Important:** `Extension(session): Extension<Session>` will panic at runtime with "Missing request extension" if used on a route that does NOT have `require_auth` in its middleware stack. Only use it inside the `admin_routes` block.
 
 ### CSRF Token
 
@@ -1112,20 +1341,204 @@ form hx-post="/admin/queue" hx-target="#queue-list" hx-swap="beforeend" {
 }
 ```
 
-### Password Change
+### Password Hashing
 
-Every user account must support password change. The first login after manual account creation must prompt for a new password.
+Use `argon2` crate. Never store plaintext passwords or use MD5/SHA1.
 
 ```rust
-// In the pub_user table: add must_change_password BOOLEAN NOT NULL DEFAULT false
-// Set to true when developer creates the account manually
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::password_hash::{SaltString, rand_core::OsRng};
 
-// In the require_auth middleware: after validating the session,
-// check must_change_password and redirect to /admin/change-password if true
-if session.must_change_password {
-    if !request.uri().path().starts_with("/admin/change-password") {
-        return Redirect::to("/admin/change-password").into_response();
+/// Hash a plaintext password. Call this when creating or changing a password.
+pub fn hash_password(password: &str) -> Result<String, AppError> {
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| AppError::Internal(format!("Password hashing failed: {e}")))
+}
+
+/// Verify a plaintext password against a stored hash.
+pub fn verify_password(password: &str, hash: &str) -> bool {
+    let Ok(parsed_hash) = PasswordHash::new(hash) else { return false };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .is_ok()
+}
+```
+
+### Login Handler
+
+```rust
+// src/auth/handlers.rs
+
+#[derive(Deserialize)]
+pub struct LoginForm {
+    pub username: String,
+    pub password: String,
+}
+
+pub async fn do_login(
+    State(state): State<AppState>,
+    session: TowerSession,
+    Form(form): Form<LoginForm>,
+) -> impl IntoResponse {
+    // 1. Load user by username
+    let user = sqlx::query!(
+        "SELECT id, pub_id, password_hash, must_change_password
+         FROM pub_user WHERE username = ?",
+        form.username
+    )
+    .fetch_optional(&state.db)
+    .await;
+
+    let user = match user {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            // Username not found — return same error as wrong password (no enumeration)
+            return Html(render_login_error("Invalid username or password").into_string())
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!("Login DB error: {e}");
+            return Html(render_login_error("Login failed, please try again").into_string())
+                .into_response();
+        }
+    };
+
+    // 2. Verify password
+    if !verify_password(&form.password, &user.password_hash) {
+        return Html(render_login_error("Invalid username or password").into_string())
+            .into_response();
     }
+
+    // 3. Store session data
+    let csrf_token = generate_csrf_token();
+    let _ = session.insert("user_id", user.id).await;
+    let _ = session.insert("pub_id", user.pub_id).await;
+    let _ = session.insert("csrf_token", csrf_token).await;
+    let _ = session.insert("must_change_password", user.must_change_password).await;
+
+    // 4. Redirect — if must_change_password, go straight to change-password
+    if user.must_change_password {
+        Redirect::to("/admin/change-password").into_response()
+    } else {
+        Redirect::to("/admin/taps").into_response()
+    }
+}
+```
+
+### Password Change
+
+Every user account must support password change. The `must_change_password` flag is set to `true` when a developer creates an account manually — the user is forced to change on first login.
+
+**Migration addition:**
+```sql
+-- In migrations/20260401000001_create_users.sql
+CREATE TABLE IF NOT EXISTS pub_user (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pub_id INTEGER NOT NULL REFERENCES pub(id),
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    must_change_password BOOLEAN NOT NULL DEFAULT true,  -- true = force change on next login
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+**Middleware check** (add to `require_auth` after session validation):
+```rust
+// After extracting user_id, pub_id, csrf_token from session:
+let must_change: bool = session.get("must_change_password").await.ok().flatten()
+    .unwrap_or(false);
+
+if must_change && !request.uri().path().starts_with("/admin/change-password")
+                && !request.uri().path().starts_with("/auth/logout") {
+    return Redirect::to("/admin/change-password").into_response();
+}
+```
+
+**Change password handler:**
+```rust
+#[derive(Deserialize)]
+pub struct ChangePasswordForm {
+    pub csrf_token: String,
+    pub current_password: String,
+    pub new_password: String,
+    pub confirm_password: String,
+}
+
+pub async fn change_password(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    tower_session: TowerSession,
+    Form(form): Form<ChangePasswordForm>,
+) -> impl IntoResponse {
+    // 1. CSRF check
+    if form.csrf_token != session.csrf_token {
+        return (StatusCode::FORBIDDEN, Html("Forbidden".to_string())).into_response();
+    }
+
+    // 2. New passwords match
+    if form.new_password != form.confirm_password {
+        return Html(render_change_password_error("New passwords do not match").into_string())
+            .into_response();
+    }
+
+    // 3. Minimum length
+    if form.new_password.len() < 8 {
+        return Html(render_change_password_error("Password must be at least 8 characters").into_string())
+            .into_response();
+    }
+
+    // 4. Load current hash and verify old password
+    let user = sqlx::query!(
+        "SELECT password_hash FROM pub_user WHERE id = ?",
+        session.user_id
+    )
+    .fetch_one(&state.db)
+    .await;
+
+    let user = match user {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!("Change password DB error: {e}");
+            return Html(render_change_password_error("Database error").into_string()).into_response();
+        }
+    };
+
+    if !verify_password(&form.current_password, &user.password_hash) {
+        return Html(render_change_password_error("Current password is incorrect").into_string())
+            .into_response();
+    }
+
+    // 5. Hash and store new password, clear must_change_password
+    let new_hash = match hash_password(&form.new_password) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("Password hashing error: {e}");
+            return Html(render_change_password_error("Password change failed").into_string())
+                .into_response();
+        }
+    };
+
+    let result = sqlx::query!(
+        "UPDATE pub_user SET password_hash = ?, must_change_password = false WHERE id = ?",
+        new_hash,
+        session.user_id
+    )
+    .execute(&state.db)
+    .await;
+
+    if let Err(e) = result {
+        tracing::error!("Failed to update password: {e}");
+        return Html(render_change_password_error("Database error").into_string()).into_response();
+    }
+
+    // 6. Update session flag so middleware doesn't redirect again
+    let _ = tower_session.insert("must_change_password", false).await;
+
+    Redirect::to("/admin/taps").into_response()
 }
 ```
 
@@ -1165,6 +1578,9 @@ pub enum AppError {
     NotFound(&'static str),
     Database(sqlx::Error),
     Unauthorized,
+    Conflict(String),       // Race condition: resource already modified (e.g. queue item deleted)
+    Validation(String),     // Invalid input from user (form validation failure)
+    BadRequest(String),     // Malformed request (wrong data type, missing field)
     Internal(String),
 }
 
@@ -1176,19 +1592,22 @@ impl From<sqlx::Error> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        let (status, message) = match &self {
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, *msg),
-            AppError::Unauthorized => (StatusCode::FORBIDDEN, "Not authorised"),
+        let (status, message): (StatusCode, String) = match self {
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.to_string()),
+            AppError::Unauthorized => (StatusCode::FORBIDDEN, "Not authorised".to_string()),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            AppError::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::Database(e) => {
                 tracing::error!("Database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "A database error occurred")
+                (StatusCode::INTERNAL_SERVER_ERROR, "A database error occurred".to_string())
             }
             AppError::Internal(msg) => {
                 tracing::error!("Internal error: {msg}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "An internal error occurred")
+                (StatusCode::INTERNAL_SERVER_ERROR, "An internal error occurred".to_string())
             }
         };
-        (status, Html(render_error_partial(message).into_string())).into_response()
+        (status, Html(render_error_partial(&message).into_string())).into_response()
     }
 }
 ```
@@ -1285,6 +1704,34 @@ When v2 is needed: add a separate `v2_routes` block. Both run in parallel until 
 <script src="https://beerview.app/v1/embed.js" data-pub="u-cerneho-vola"></script>
 ```
 
+### Serving the Widget Script
+
+The `embed.js` file is served from the Rust binary. It is compiled in from the filesystem at build time using `include_str!`:
+
+```rust
+// src/public/tap_list.rs (or src/embed/mod.rs)
+
+use axum::response::Response;
+use axum::http::{header, StatusCode};
+
+const EMBED_JS: &str = include_str!("../../src/embed/widget.js");
+
+pub async fn serve_embed_js() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
+        // Cache for 1 hour — pub sites don't need instant widget updates
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .body(axum::body::Body::from(EMBED_JS))
+        .unwrap()  // safe: headers are all static valid values
+}
+```
+
+Register in the v1 routes (already shown in Section 8):
+```rust
+.route("/v1/embed.js", get(serve_embed_js))
+```
+
 ### Widget Implementation
 
 ```javascript
@@ -1299,7 +1746,8 @@ When v2 is needed: add a separate `v2_routes` block. Both run in parallel until 
         return;
     }
 
-    var apiBase = script.src.replace(/\/v1\/embed\.js.*$/, "");
+    // Use URL parsing instead of regex — handles query strings, ports, paths correctly
+    var apiBase = new URL(script.src).origin;
     var apiUrl = apiBase + "/v1/pubs/" + encodeURIComponent(pubSlug) + "/taps";
 
     var container = document.createElement("div");
@@ -1543,3 +1991,247 @@ async fn test_switch_tap_invalid_queue_item_returns_error() {
 3. CSRF validation — rejects mismatched tokens
 4. Public API JSON schema — correct structure for embed widget consumers
 5. Edge cases — empty queue switch, marking already-empty tap, concurrent switches
+6. Undo — restores correctly within 30s, rejects after 30s, cannot be applied twice
+
+---
+
+## 11. Webhook Delivery
+
+### Overview
+
+When a tap switch happens, beerview POSTs the full current tap list to the pub's registered webhook URL. This is fire-and-forget (best-effort): if delivery fails, it is logged as a warning but does NOT fail the switch operation.
+
+The webhook call is always spawned in a `tokio::spawn` background task from the switch handler — it must never block the HTTP response.
+
+### Webhook Payload
+
+The payload is identical to the `/v1/pubs/:slug/taps` JSON response, with an added `event` field:
+
+```json
+{
+  "event": "taps_changed",
+  "schema_version": "1",
+  "pub_name": "U Černého vola",
+  "pub_slug": "u-cerneho-vola",
+  "updated_at": "2026-04-12T14:30:00Z",
+  "taps": [
+    {
+      "tap_number": 1,
+      "beer": {
+        "name": "Raptor IPA",
+        "brewery": "Pivovar Matuška",
+        "style": "IPA",
+        "abv": 6.5
+      },
+      "prices": [{"size": "0.5l", "price": 79}]
+    }
+  ]
+}
+```
+
+### Implementation (`src/webhook.rs`)
+
+```rust
+use reqwest::Client;
+use sqlx::SqlitePool;
+use std::time::Duration;
+use crate::error::AppError;
+
+/// Fire the pub's outbound webhook with the full current tap list.
+/// Returns Ok(()) if no webhook is configured or if delivery succeeded.
+/// Returns Err if delivery failed — caller should log as warn, not error.
+pub async fn fire_webhook(db: &SqlitePool, pub_id: i64) -> Result<(), AppError> {
+    // 1. Load pub — check if webhook is configured
+    let pub_record = sqlx::query!(
+        "SELECT slug, name, webhook_url FROM pub WHERE id = ?",
+        pub_id
+    )
+    .fetch_one(db)
+    .await?;
+
+    let Some(webhook_url) = pub_record.webhook_url else {
+        return Ok(()); // No webhook registered — nothing to do
+    };
+
+    // 2. Build the payload (full current tap list)
+    let payload = build_webhook_payload(db, pub_id, &pub_record.slug, &pub_record.name).await?;
+
+    // 3. POST to webhook URL with a 5-second timeout
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| AppError::Internal(format!("HTTP client build error: {e}")))?;
+
+    let response = client
+        .post(&webhook_url)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "beerview-webhook/1.0")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Webhook delivery failed: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "Webhook URL {} returned HTTP {}",
+            webhook_url,
+            response.status()
+        )));
+    }
+
+    tracing::info!(pub_id, webhook_url, "Webhook delivered successfully");
+    Ok(())
+}
+
+/// Builds the webhook JSON payload — same structure as /v1/pubs/:slug/taps plus event field.
+async fn build_webhook_payload(
+    db: &SqlitePool,
+    pub_id: i64,
+    slug: &str,
+    name: &str,
+) -> Result<serde_json::Value, AppError> {
+    let taps = sqlx::query!(
+        "SELECT t.tap_number, b.name as beer_name, b.brewery, b.style, b.abv, t.prices
+         FROM tap t
+         LEFT JOIN beer b ON t.beer_id = b.id
+         WHERE t.pub_id = ?
+         ORDER BY t.tap_number",
+        pub_id
+    )
+    .fetch_all(db)
+    .await?;
+
+    let taps_json: Vec<serde_json::Value> = taps
+        .into_iter()
+        .filter(|t| t.beer_name.is_some())  // Only include taps with a beer
+        .map(|t| {
+            let prices: Vec<serde_json::Value> = t.prices
+                .as_deref()
+                .and_then(|p| serde_json::from_str(p).ok())
+                .unwrap_or_default();
+            serde_json::json!({
+                "tap_number": t.tap_number,
+                "beer": {
+                    "name": t.beer_name.unwrap_or_default(),
+                    "brewery": t.brewery.unwrap_or_default(),
+                    "style": t.style,
+                    "abv": t.abv,
+                },
+                "prices": prices,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "event": "taps_changed",
+        "schema_version": "1",
+        "pub_name": name,
+        "pub_slug": slug,
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+        "taps": taps_json,
+    }))
+}
+```
+
+### Calling from the Switch Handler
+
+```rust
+// In switch_tap handler, after execute_switch succeeds:
+let db = state.db.clone();
+let pub_id = session.pub_id;
+tokio::spawn(async move {
+    if let Err(e) = fire_webhook(&db, pub_id).await {
+        // Best-effort: warn but do not alert the user
+        tracing::warn!(pub_id, "Webhook delivery failed (non-fatal): {e}");
+    }
+});
+```
+
+No retry logic. If the webhook fails, the pub owner will see their tap list update correctly — the webhook is just a convenience for third-party integrations.
+
+---
+
+## 12. Cargo.toml Reference
+
+Use these dependency versions as the baseline. Do not upgrade without testing.
+
+```toml
+[package]
+name = "beerview"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+
+# Sessions (use 0.12 — API changed significantly before this)
+tower-sessions = { version = "0.12", features = ["memory-store"] }
+time = { version = "0.3", features = ["serde"] }
+
+# Database
+sqlx = { version = "0.8", features = [
+    "sqlite",
+    "runtime-tokio-rustls",
+    "macros",
+    "migrate",
+] }
+
+# Templating
+maud = { version = "0.26", features = ["axum"] }
+
+# Serialisation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Password hashing
+argon2 = "0.5"
+
+# CSRF token generation
+rand = "0.8"
+hex = "0.4"
+
+# Outbound webhooks
+reqwest = { version = "0.12", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging/tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Environment variables
+dotenvy = "0.15"
+
+[dev-dependencies]
+tokio-test = "0.4"
+```
+
+**Notes:**
+- `tower-sessions` uses `MemoryStore` for the PoC — sessions are lost on server restart, which is acceptable during development. All 3 pilot pubs will need to re-login after a restart.
+- `reqwest` is only needed because of webhooks. If you're skipping webhooks in early development, you can omit it.
+- `chrono` provides `Utc::now().to_rfc3339()` for the webhook `updated_at` field. If you're not implementing webhooks yet, omit it and use `datetime('now')` from SQLite directly.
+
+### SQLite WAL Mode
+
+Enable WAL (Write-Ahead Logging) for better concurrent read performance. Add this to your pool setup:
+
+```rust
+pub async fn create_pool(database_url: &str) -> SqlitePool {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(database_url)
+        .await
+        .expect("Failed to create database pool");
+
+    // Enable WAL mode — reduces read/write contention on SQLite
+    sqlx::query("PRAGMA journal_mode=WAL")
+        .execute(&pool)
+        .await
+        .expect("Failed to enable WAL mode");
+
+    pool
+}
+```
