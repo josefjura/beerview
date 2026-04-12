@@ -1,0 +1,31 @@
+[package]
+name = "beerview"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "beerview"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+tower-sessions = { version = "0.12", features = ["memory-store"] }
+time = { version = "0.3", features = ["serde"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "macros", "migrate"] }
+maud = { version = "0.26", features = ["axum"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+argon2 = "0.5"
+rand = "0.8"
+hex = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+
+[dev-dependencies]
+tokio-test = "0.4"
