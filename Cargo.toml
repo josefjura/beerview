@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "beerview"
 path = "src/main.rs"
 
+[[bin]]
+name = "beerview-admin"
+path = "src/bin/admin.rs"
+
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
@@ -30,6 +34,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
