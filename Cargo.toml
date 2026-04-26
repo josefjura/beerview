@@ -3,6 +3,10 @@ name = "beerview"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "beerview"
+path = "src/lib.rs"
+
 [[bin]]
 name = "beerview"
 path = "src/main.rs"
@@ -29,3 +33,4 @@ dotenvy = "0.15"
 
 [dev-dependencies]
 tokio-test = "0.4"
+tokio = { version = "1", features = ["full"] }

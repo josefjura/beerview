@@ -410,3 +410,102 @@ pub async fn mark_empty(
     let html = crate::templates::admin_taps::render_tap_row(&session, &tap_view);
     axum::response::Html(html.into_string()).into_response()
 }
+
+/// Core switch logic — used by handler and tests.
+pub async fn execute_switch(
+    db: &sqlx::SqlitePool,
+    pub_id: i64,
+    tap_number: i64,
+    queue_item_id: i64,
+) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+
+    let qi = sqlx::query_as::<_, (i64, i64, Option<String>)>(
+        "SELECT id, beer_id, prices FROM queue_item WHERE id=? AND pub_id=?"
+    )
+    .bind(queue_item_id).bind(pub_id)
+    .fetch_optional(db).await.map_err(AppError::Database)?
+    .ok_or(AppError::NotFound("Queue item not found"))?;
+
+    let (qi_id, new_beer_id, new_prices) = qi;
+
+    let (old_pos,) = sqlx::query_as::<_, (i64,)>(
+        "SELECT position FROM queue_item WHERE id=?"
+    )
+    .bind(qi_id).fetch_one(db).await.map_err(AppError::Database)?;
+
+    let mut tx = db.begin().await.map_err(AppError::Database)?;
+
+    sqlx::query(
+        "INSERT OR REPLACE INTO tap_switch_undo (pub_id, tap_number, prev_beer_id, prev_prices, switched_at)
+         VALUES (?,?,
+           (SELECT beer_id FROM tap WHERE pub_id=? AND tap_number=?),
+           (SELECT prices  FROM tap WHERE pub_id=? AND tap_number=?),
+           datetime('now'))"
+    )
+    .bind(pub_id).bind(tap_number)
+    .bind(pub_id).bind(tap_number)
+    .bind(pub_id).bind(tap_number)
+    .execute(&mut *tx).await.map_err(AppError::Database)?;
+
+    sqlx::query(
+        "INSERT INTO tap_history (pub_id, tap_number, beer_id, prices, tapped_at, removed_at)
+         SELECT pub_id, tap_number, beer_id, prices, updated_at, datetime('now')
+         FROM tap WHERE pub_id=? AND tap_number=? AND beer_id IS NOT NULL"
+    )
+    .bind(pub_id).bind(tap_number)
+    .execute(&mut *tx).await.map_err(AppError::Database)?;
+
+    sqlx::query("UPDATE tap SET beer_id=?, prices=?, updated_at=datetime('now') WHERE pub_id=? AND tap_number=?")
+        .bind(new_beer_id).bind(&new_prices).bind(pub_id).bind(tap_number)
+        .execute(&mut *tx).await.map_err(AppError::Database)?;
+
+    sqlx::query("DELETE FROM queue_item WHERE id=?")
+        .bind(qi_id).execute(&mut *tx).await.map_err(AppError::Database)?;
+
+    sqlx::query("UPDATE queue_item SET position=position-1 WHERE pub_id=? AND position>?")
+        .bind(pub_id).bind(old_pos).execute(&mut *tx).await.map_err(AppError::Database)?;
+
+    tx.commit().await.map_err(AppError::Database)?;
+    Ok(())
+}
+
+/// Core undo logic.
+pub async fn execute_undo(
+    db: &sqlx::SqlitePool,
+    pub_id: i64,
+    tap_number: i64,
+) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+
+    let snapshot = sqlx::query_as::<_, (Option<i64>, Option<String>)>(
+        "SELECT prev_beer_id, prev_prices FROM tap_switch_undo
+         WHERE pub_id=? AND tap_number=? AND switched_at > datetime('now', '-30 seconds')"
+    )
+    .bind(pub_id).bind(tap_number)
+    .fetch_optional(db).await.map_err(AppError::Database)?
+    .ok_or(AppError::Conflict("Undo window has expired or no undo available".to_string()))?;
+
+    let (prev_beer_id, prev_prices) = snapshot;
+
+    let mut tx = db.begin().await.map_err(AppError::Database)?;
+
+    sqlx::query("UPDATE tap SET beer_id=?, prices=?, updated_at=datetime('now') WHERE pub_id=? AND tap_number=?")
+        .bind(prev_beer_id).bind(&prev_prices).bind(pub_id).bind(tap_number)
+        .execute(&mut *tx).await.map_err(AppError::Database)?;
+
+    sqlx::query("DELETE FROM tap_switch_undo WHERE pub_id=? AND tap_number=?")
+        .bind(pub_id).bind(tap_number)
+        .execute(&mut *tx).await.map_err(AppError::Database)?;
+
+    sqlx::query(
+        "DELETE FROM tap_history WHERE rowid=(
+           SELECT rowid FROM tap_history WHERE pub_id=? AND tap_number=?
+           ORDER BY removed_at DESC LIMIT 1)"
+    )
+    .bind(pub_id).bind(tap_number)
+    .execute(&mut *tx).await.map_err(AppError::Database)?;
+
+    tx.commit().await.map_err(AppError::Database)?;
+    Ok(())
+}
