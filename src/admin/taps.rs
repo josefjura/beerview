@@ -72,12 +72,146 @@ pub struct SwitchForm {
 }
 
 pub async fn switch_tap(
-    State(_state): State<AppState>,
-    Extension(_session): Extension<Session>,
-    Path(_tap_number): Path<i64>,
-    Form(_form): Form<SwitchForm>,
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(tap_number): Path<i64>,
+    Form(form): Form<SwitchForm>,
 ) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "TODO: switch tap")
+    // 1. Verify CSRF
+    if form.csrf_token != session.csrf_token {
+        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    }
+
+    // 2. Verify queue item belongs to this pub
+    let queue_item = sqlx::query_as::<_, (i64, i64, Option<String>)>(
+        "SELECT id, beer_id, prices FROM queue_item WHERE id = ? AND pub_id = ?"
+    )
+    .bind(form.queue_item_id)
+    .bind(session.pub_id)
+    .fetch_optional(&state.db)
+    .await;
+
+    let (qi_id, new_beer_id, new_prices) = match queue_item {
+        Ok(Some(row)) => row,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Queue item not found").into_response(),
+        Err(e) => {
+            tracing::error!("DB error: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    };
+
+    // 3. Get current tap position so we can reorder queue later
+    let old_position = sqlx::query_as::<_, (i64,)>(
+        "SELECT position FROM queue_item WHERE id = ?"
+    )
+    .bind(qi_id)
+    .fetch_one(&state.db)
+    .await;
+
+    let old_position = match old_position {
+        Ok((pos,)) => pos,
+        Err(e) => {
+            tracing::error!("DB error: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    };
+
+    // 4. Run everything in a transaction
+    let result = async {
+        let mut tx = state.db.begin().await?;
+
+        // Save undo snapshot
+        sqlx::query(
+            "INSERT OR REPLACE INTO tap_switch_undo (pub_id, tap_number, prev_beer_id, prev_prices, switched_at)
+             VALUES (?,
+                     ?,
+                     (SELECT beer_id FROM tap WHERE pub_id=? AND tap_number=?),
+                     (SELECT prices  FROM tap WHERE pub_id=? AND tap_number=?),
+                     datetime('now'))"
+        )
+        .bind(session.pub_id).bind(tap_number)
+        .bind(session.pub_id).bind(tap_number)
+        .bind(session.pub_id).bind(tap_number)
+        .execute(&mut *tx).await?;
+
+        // Archive old tap to history (only if it has a beer)
+        sqlx::query(
+            "INSERT INTO tap_history (pub_id, tap_number, beer_id, prices, tapped_at, removed_at)
+             SELECT pub_id, tap_number, beer_id, prices, updated_at, datetime('now')
+             FROM tap WHERE pub_id=? AND tap_number=? AND beer_id IS NOT NULL"
+        )
+        .bind(session.pub_id).bind(tap_number)
+        .execute(&mut *tx).await?;
+
+        // Put new beer on tap
+        sqlx::query(
+            "UPDATE tap SET beer_id=?, prices=?, updated_at=datetime('now')
+             WHERE pub_id=? AND tap_number=?"
+        )
+        .bind(new_beer_id).bind(&new_prices)
+        .bind(session.pub_id).bind(tap_number)
+        .execute(&mut *tx).await?;
+
+        // Remove queue item
+        sqlx::query("DELETE FROM queue_item WHERE id=?")
+            .bind(qi_id)
+            .execute(&mut *tx).await?;
+
+        // Reorder remaining queue items
+        sqlx::query(
+            "UPDATE queue_item SET position = position - 1
+             WHERE pub_id=? AND position > ?"
+        )
+        .bind(session.pub_id).bind(old_position)
+        .execute(&mut *tx).await?;
+
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(())
+    }.await;
+
+    if let Err(e) = result {
+        tracing::error!("switch_tap transaction failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Transaction failed").into_response();
+    }
+
+    // 5. Fire webhook asynchronously
+    let db = state.db.clone();
+    let pub_id = session.pub_id;
+    tokio::spawn(async move {
+        if let Err(e) = crate::webhook::fire_webhook(&db, pub_id).await {
+            tracing::warn!("Webhook failed for pub {pub_id}: {e:?}");
+        }
+    });
+
+    // 6. Return updated tap row as HTMX partial
+    // Re-query the tap to get fresh data
+    let tap_row = sqlx::query_as::<_, (i64, Option<i64>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT t.tap_number, t.beer_id, b.name, b.brewery, t.prices
+         FROM tap t LEFT JOIN beer b ON b.id = t.beer_id
+         WHERE t.pub_id=? AND t.tap_number=?"
+    )
+    .bind(session.pub_id).bind(tap_number)
+    .fetch_one(&state.db)
+    .await;
+
+    match tap_row {
+        Ok((tn, beer_id, beer_name, beer_brewery, prices)) => {
+            let tap_view = crate::admin::taps::TapView {
+                tap_number: tn,
+                beer_id,
+                beer_name,
+                beer_brewery,
+                prices,
+                can_undo: true, // just switched — undo is available
+            };
+            let html = crate::templates::admin_taps::render_tap_row(&session, &tap_view);
+            axum::response::Html(html.into_string()).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to re-query tap after switch: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load updated tap").into_response()
+        }
+    }
 }
 
 #[derive(Deserialize)]
