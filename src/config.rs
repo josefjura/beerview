@@ -3,6 +3,7 @@ use axum::routing::{delete, get, post, put};
 use tower_http::services::ServeDir;
 use tower_http::cors::{CorsLayer, Any};
 use axum::http::Method;
+use tower_sessions::{MemoryStore, SessionManagerLayer};
 
 use crate::auth;
 use crate::admin;
@@ -28,6 +29,9 @@ impl AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    let session_store = MemoryStore::default();
+    let session_layer = SessionManagerLayer::new(session_store);
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET]);
@@ -68,5 +72,6 @@ pub fn build_router(state: AppState) -> Router {
         .merge(auth_routes)
         .merge(admin_routes)
         .nest_service("/static", ServeDir::new("static"))
+        .layer(session_layer)
         .with_state(state)
 }
