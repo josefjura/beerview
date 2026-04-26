@@ -38,10 +38,13 @@ pub fn build_router(state: AppState) -> Router {
 
     let v1_routes = Router::new()
         .route("/v1/pubs", get(public::discovery::list_pubs))
-        .route("/v1/pubs/{slug}", get(public::pub_detail::show_pub))
         .route("/v1/pubs/{slug}/taps", get(public::tap_list::get_taps_json))
         .route("/v1/embed.js", get(public::tap_list::serve_embed_js))
         .layer(cors);
+
+    let public_html_routes = Router::new()
+        .route("/pubs", get(public::discovery::discovery_page))
+        .route("/pubs/{slug}", get(public::pub_detail::show_pub));
 
     let auth_routes = Router::new()
         .route("/auth/login", get(auth::handlers::show_login))
@@ -69,6 +72,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .merge(v1_routes)
+        .merge(public_html_routes)
         .merge(auth_routes)
         .merge(admin_routes)
         .nest_service("/static", ServeDir::new("static"))
