@@ -58,7 +58,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/queue/{id}", delete(admin::queue::remove_from_queue))
         .route("/admin/queue/{id}/position", put(admin::queue::update_position))
         .route("/admin/settings", get(admin::settings::show_settings))
-        .route("/admin/settings", put(admin::settings::update_settings))
+        .route("/admin/settings", post(admin::settings::update_settings))
         .route("/admin/change-password", get(admin::settings::show_change_password))
         .route("/admin/change-password", post(admin::settings::change_password))
         .route("/beers/search", get(beer::search::search_beers))
