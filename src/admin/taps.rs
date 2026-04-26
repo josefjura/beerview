@@ -220,12 +220,109 @@ pub struct CsrfForm {
 }
 
 pub async fn undo_switch(
-    State(_state): State<AppState>,
-    Extension(_session): Extension<Session>,
-    Path(_tap_number): Path<i64>,
-    Form(_form): Form<CsrfForm>,
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(tap_number): Path<i64>,
+    Form(form): Form<CsrfForm>,
 ) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "TODO: undo switch")
+    // 1. Verify CSRF
+    if form.csrf_token != session.csrf_token {
+        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    }
+
+    // 2. Load undo snapshot
+    let snapshot = sqlx::query_as::<_, (Option<i64>, Option<String>, String)>(
+        "SELECT prev_beer_id, prev_prices, switched_at
+         FROM tap_switch_undo WHERE pub_id=? AND tap_number=?"
+    )
+    .bind(session.pub_id).bind(tap_number)
+    .fetch_optional(&state.db)
+    .await;
+
+    let (prev_beer_id, prev_prices, _switched_at) = match snapshot {
+        Ok(Some(row)) => row,
+        Ok(None) => return (StatusCode::NOT_FOUND, "No undo available for this tap").into_response(),
+        Err(e) => {
+            tracing::error!("DB error: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    };
+
+    // 3. Check window (30 seconds) — query returns nothing if expired
+    let still_valid = sqlx::query_as::<_, (i64,)>(
+        "SELECT 1 FROM tap_switch_undo
+         WHERE pub_id=? AND tap_number=? AND switched_at > datetime('now', '-30 seconds')"
+    )
+    .bind(session.pub_id).bind(tap_number)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    if still_valid.is_none() {
+        return (StatusCode::CONFLICT, "Undo window has expired").into_response();
+    }
+
+    // 4. Transaction: restore tap, delete undo snapshot, remove last history entry
+    let result = async {
+        let mut tx = state.db.begin().await?;
+
+        sqlx::query(
+            "UPDATE tap SET beer_id=?, prices=?, updated_at=datetime('now')
+             WHERE pub_id=? AND tap_number=?"
+        )
+        .bind(prev_beer_id).bind(&prev_prices)
+        .bind(session.pub_id).bind(tap_number)
+        .execute(&mut *tx).await?;
+
+        sqlx::query(
+            "DELETE FROM tap_switch_undo WHERE pub_id=? AND tap_number=?"
+        )
+        .bind(session.pub_id).bind(tap_number)
+        .execute(&mut *tx).await?;
+
+        sqlx::query(
+            "DELETE FROM tap_history WHERE rowid = (
+                SELECT rowid FROM tap_history
+                WHERE pub_id=? AND tap_number=?
+                ORDER BY removed_at DESC LIMIT 1
+             )"
+        )
+        .bind(session.pub_id).bind(tap_number)
+        .execute(&mut *tx).await?;
+
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(())
+    }.await;
+
+    if let Err(e) = result {
+        tracing::error!("undo_switch transaction failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Transaction failed").into_response();
+    }
+
+    // 5. Return updated tap row
+    let tap_row = sqlx::query_as::<_, (i64, Option<i64>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT t.tap_number, t.beer_id, b.name, b.brewery, t.prices
+         FROM tap t LEFT JOIN beer b ON b.id = t.beer_id
+         WHERE t.pub_id=? AND t.tap_number=?"
+    )
+    .bind(session.pub_id).bind(tap_number)
+    .fetch_one(&state.db)
+    .await;
+
+    match tap_row {
+        Ok((tn, beer_id, beer_name, beer_brewery, prices)) => {
+            let tap_view = crate::admin::taps::TapView {
+                tap_number: tn, beer_id, beer_name, beer_brewery, prices,
+                can_undo: false, // just undone
+            };
+            let html = crate::templates::admin_taps::render_tap_row(&session, &tap_view);
+            axum::response::Html(html.into_string()).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to re-query tap after undo: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load updated tap").into_response()
+        }
+    }
 }
 
 pub async fn mark_empty(
