@@ -326,10 +326,87 @@ pub async fn undo_switch(
 }
 
 pub async fn mark_empty(
-    State(_state): State<AppState>,
-    Extension(_session): Extension<Session>,
-    Path(_tap_number): Path<i64>,
-    Form(_form): Form<CsrfForm>,
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(tap_number): Path<i64>,
+    Form(form): Form<CsrfForm>,
 ) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "TODO: mark tap empty")
+    // 1. Verify CSRF
+    if form.csrf_token != session.csrf_token {
+        return (StatusCode::FORBIDDEN, "Invalid CSRF token").into_response();
+    }
+
+    // 2. Check if already empty — idempotent
+    let tap = sqlx::query_as::<_, (Option<i64>,)>(
+        "SELECT beer_id FROM tap WHERE pub_id=? AND tap_number=?"
+    )
+    .bind(session.pub_id).bind(tap_number)
+    .fetch_optional(&state.db)
+    .await;
+
+    let beer_id = match tap {
+        Ok(Some((beer_id,))) => beer_id,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Tap not found").into_response(),
+        Err(e) => {
+            tracing::error!("DB error: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    };
+
+    if beer_id.is_some() {
+        // 3. Transaction: archive to history, clear tap, delete undo snapshot
+        let result = async {
+            let mut tx = state.db.begin().await?;
+
+            sqlx::query(
+                "INSERT INTO tap_history (pub_id, tap_number, beer_id, prices, tapped_at, removed_at)
+                 SELECT pub_id, tap_number, beer_id, prices, updated_at, datetime('now')
+                 FROM tap WHERE pub_id=? AND tap_number=? AND beer_id IS NOT NULL"
+            )
+            .bind(session.pub_id).bind(tap_number)
+            .execute(&mut *tx).await?;
+
+            sqlx::query(
+                "UPDATE tap SET beer_id=NULL, prices=NULL, updated_at=datetime('now')
+                 WHERE pub_id=? AND tap_number=?"
+            )
+            .bind(session.pub_id).bind(tap_number)
+            .execute(&mut *tx).await?;
+
+            sqlx::query(
+                "DELETE FROM tap_switch_undo WHERE pub_id=? AND tap_number=?"
+            )
+            .bind(session.pub_id).bind(tap_number)
+            .execute(&mut *tx).await?;
+
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(())
+        }.await;
+
+        if let Err(e) = result {
+            tracing::error!("mark_empty transaction failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Transaction failed").into_response();
+        }
+
+        // Fire webhook
+        let db = state.db.clone();
+        let pub_id = session.pub_id;
+        tokio::spawn(async move {
+            if let Err(e) = crate::webhook::fire_webhook(&db, pub_id).await {
+                tracing::warn!("Webhook failed for pub {pub_id}: {e:?}");
+            }
+        });
+    }
+
+    // 4. Return updated tap row (empty)
+    let tap_view = crate::admin::taps::TapView {
+        tap_number,
+        beer_id: None,
+        beer_name: None,
+        beer_brewery: None,
+        prices: None,
+        can_undo: false,
+    };
+    let html = crate::templates::admin_taps::render_tap_row(&session, &tap_view);
+    axum::response::Html(html.into_string()).into_response()
 }
